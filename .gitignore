@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated reports
+out/
+*.csv
+
+# Env / secrets
+.env
