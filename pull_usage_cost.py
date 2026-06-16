@@ -141,9 +141,22 @@ def _token_entries(r: dict) -> dict:
 
 def _new_key_record() -> dict:
     return {
-        "tokens": defaultdict(int),  # token_type -> count (for the usage table)
-        "tuples": defaultdict(int),  # (model, tier, ctx, token_type) -> count (for costing)
-        "web_search_requests": 0,
+        "tokens": defaultdict(int),        # token_type -> count (for the usage table)
+        "tuples": defaultdict(int),        # (model, tier, ctx, token_type) -> count (for costing)
+        "web_search_requests": 0,          # total across models (for the per-key table)
+        "web_by_model": defaultdict(int),  # model -> web_search_requests (for the model breakdown)
+    }
+
+
+def _empty_model_record() -> dict:
+    """One (api_key, model) cell in the model breakdown. Money values are Decimal cents."""
+    return {
+        "tokens": defaultdict(int),  # token_type -> count
+        "token_cost": Decimal("0"),
+        "web_requests": 0,
+        "web_cost": Decimal("0"),
+        "total": Decimal("0"),
+        "unpriced_tokens": 0,
     }
 
 
@@ -164,7 +177,9 @@ def fetch_usage(session, starting_at: str, ending_at: str) -> dict:
             for token_type, n in _token_entries(r).items():
                 rec["tokens"][token_type] += n
                 rec["tuples"][dims + (token_type,)] += n
-            rec["web_search_requests"] += (r.get("server_tool_use") or {}).get("web_search_requests") or 0
+            wreq = (r.get("server_tool_use") or {}).get("web_search_requests") or 0
+            rec["web_search_requests"] += wreq
+            rec["web_by_model"][r.get("model")] += wreq
     return keys
 
 
@@ -243,18 +258,28 @@ def compute_key_costs(usage: dict, cost: dict) -> dict:
             cost_without_usage += cents
     web_rate = (cost["web_search"] / Decimal(total_web)) if total_web > 0 else Decimal("0")
 
-    # Per-key application.
+    # Per-key application, plus a per-(key, model) drill-down built from the same tuples.
     per_key: dict = {}
+    per_key_model: dict = defaultdict(_empty_model_record)
     unpriced_by_tier: dict = defaultdict(int)
     for kid, rec in usage.items():
         token_cost = Decimal("0")
         unpriced = 0
         for tup, n in rec["tuples"].items():
+            km = per_key_model[(kid, tup[0])]   # tup[0] is model
+            km["tokens"][tup[3]] += n           # tup[3] is token_type
             if tup in rate:
-                token_cost += Decimal(n) * rate[tup]
+                c = Decimal(n) * rate[tup]
+                token_cost += c
+                km["token_cost"] += c
             elif n > 0:
                 unpriced += n
-                unpriced_by_tier[tup[1]] += n  # tup[1] is service_tier
+                unpriced_by_tier[tup[1]] += n   # tup[1] is service_tier
+                km["unpriced_tokens"] += n
+        for model, reqs in rec.get("web_by_model", {}).items():
+            km = per_key_model[(kid, model)]
+            km["web_requests"] += reqs
+            km["web_cost"] += Decimal(reqs) * web_rate
         web_cost = Decimal(rec["web_search_requests"]) * web_rate
         per_key[kid] = {
             "token_cost": token_cost,
@@ -262,12 +287,15 @@ def compute_key_costs(usage: dict, cost: dict) -> dict:
             "total": token_cost + web_cost,
             "unpriced_tokens": unpriced,
         }
+    for km in per_key_model.values():
+        km["total"] = km["token_cost"] + km["web_cost"]
 
     attributed = sum((v["total"] for v in per_key.values()), Decimal("0"))
     org_level = cost["code_execution"] + cost["session_usage"] + cost["other"]
     grand = cost["grand_total"]
     return {
         "per_key": per_key,
+        "per_key_model": dict(per_key_model),
         "composition": {
             "tokens": sum(cost["by_tuple"].values(), Decimal("0")),
             "web_search": cost["web_search"],
@@ -323,6 +351,28 @@ def print_usage_table(usage: dict, key_names: dict, per_key_cost: dict) -> None:
             f"{web:>9,}"
             f"{_fmt_usd(cost):>15}"
         )
+
+
+def print_usage_by_model(per_key_model: dict, per_key: dict, key_names: dict) -> None:
+    """Flat per-(API key, model) usage + estimated cost, grouped by key. Additive — the
+    per-key summary table is unchanged; this is the drill-down beneath it."""
+    print("\n=== Usage & cost by API key x model ===")
+    if not per_key_model:
+        print("  (no usage in this period)")
+        return
+    by_key: dict = defaultdict(list)
+    for (kid, model), km in per_key_model.items():
+        by_key[kid].append((model, km))
+    ordered_kids = sorted(by_key, key=lambda k: per_key[k]["total"], reverse=True)
+
+    hdr = f"{'API key':<30}{'model':<24}{'total_tok':>16}{'est_cost_usd':>15}"
+    print(hdr)
+    print("-" * len(hdr))
+    for kid in ordered_kids:
+        label = key_label(kid, key_names)
+        for model, km in sorted(by_key[kid], key=lambda mk: mk[1]["total"], reverse=True):
+            total_tok = sum(km["tokens"].values())
+            print(f"{label[:30]:<30}{(model or '(unknown)')[:24]:<24}{total_tok:>16,}{_fmt_usd(km['total']):>15}")
 
 
 def print_cost_breakdown(result: dict, usage: dict, key_names: dict) -> None:
@@ -488,6 +538,7 @@ def main() -> None:
     cost_ws = fetch_cost_by_workspace(session, starting_at, ending_at)
 
     print_usage_table(usage, key_names, result["per_key"])
+    print_usage_by_model(result["per_key_model"], result["per_key"], key_names)
     print_cost_breakdown(result, usage, key_names)
     print_cost_table("Cost by workspace (USD) — ground truth", cost_ws, ws_names)
 
@@ -518,6 +569,26 @@ def main() -> None:
              "cache_creation_input_tokens", "output_tokens", "total_tokens", "web_search_requests",
              "token_cost_usd", "web_search_cost_usd", "est_cost_usd", "unpriced_tokens"],
             usage_rows,
+        )
+        model_rows = []
+        for (kid, model), km in result["per_key_model"].items():
+            t = km["tokens"]
+            cache_create = (t.get("cache_creation.ephemeral_1h_input_tokens", 0)
+                            + t.get("cache_creation.ephemeral_5m_input_tokens", 0))
+            model_rows.append([
+                kid or "", key_label(kid, key_names), model or "",
+                t.get("uncached_input_tokens", 0), t.get("cache_read_input_tokens", 0), cache_create,
+                t.get("output_tokens", 0), sum(t.values()), km["web_requests"],
+                f"{_usd(km['token_cost']):.6f}", f"{_usd(km['web_cost']):.6f}", f"{_usd(km['total']):.6f}",
+                km["unpriced_tokens"],
+            ])
+        model_rows.sort(key=lambda r: (r[1], r[0]))  # group by key name, then key id
+        write_csv(
+            out / "usage_cost_by_api_key_model.csv",
+            ["api_key_id", "api_key_name", "model", "uncached_input_tokens", "cache_read_input_tokens",
+             "cache_creation_input_tokens", "output_tokens", "total_tokens", "web_search_requests",
+             "token_cost_usd", "web_search_cost_usd", "est_cost_usd", "unpriced_tokens"],
+            model_rows,
         )
         comp = result["composition"]
         write_csv(
