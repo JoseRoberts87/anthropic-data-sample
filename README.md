@@ -1,10 +1,14 @@
 # Anthropic API usage & cost puller
 
-A small Python script (`pull_usage_cost.py`) that pulls your organization's **token usage**
-and **USD cost** from the Anthropic [Admin API](https://platform.claude.com/docs/en/manage-claude/admin-api),
-and estimates **cost per API key** — including a breakdown by model.
+Two Python scripts that pull your organization's **token usage** and **USD cost** from the
+Anthropic [Admin API](https://platform.claude.com/docs/en/manage-claude/admin-api) and estimate
+**cost per API key** (with a per-model breakdown):
 
-It talks to four endpoints under `https://api.anthropic.com/v1/organizations`:
+- **`pull_usage_cost.py`** — the base tool.
+- **`pull_usage_cost_hybrid.py`** — adds fast-mode-aware cost attribution; see
+  [Fast mode and the hybrid variant](#fast-mode-and-the-hybrid-variant).
+
+Both share the same CLI and talk to four endpoints under `https://api.anthropic.com/v1/organizations`:
 
 | Endpoint | Used for |
 |---|---|
@@ -112,6 +116,49 @@ fields 1:1, so the join is exact and per-key estimates **sum back to the cost-en
 - **Default workspace** has no `workspace_id`.
 - Data typically appears within **~5 minutes**; the API supports polling about **once per minute**.
 
+## Fast mode and the hybrid variant
+
+[Fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) is a faster,
+**premium-priced** variant of Opus (research preview). Its price is a flat per-model multiple of
+standard, across every token type: **Opus 4.8 = 2×**, **Opus 4.6 / 4.7 = 6×**.
+
+**The problem the base tool has with it:** the cost endpoint has no `speed` dimension, so fast
+and standard usage of the same model collapse into one cost figure. The base tool's derived rate
+is therefore a volume-weighted *blend*. Org and workspace totals still reconcile, but **per-key**
+dollars skew — a fast-heavy key is under-charged and a standard-heavy key over-charged, by up to
+the 2×/6× gap.
+
+**`pull_usage_cost_hybrid.py` fixes it.** The *usage* endpoint can split by `speed`, so it groups
+usage by speed and decomposes the combined cost with the known multiplier `M`:
+
+```
+standard_rate = cost / (standard_tokens + M·fast_tokens)
+per-key fast  = M · standard_rate · key_fast_tokens
+```
+
+This recovers the true standard rate out of the blended figure, prices fast tokens exactly (when
+`M` is correct), still reconciles to the cost-endpoint total, and produces **identical results to
+the base tool when there's no fast usage**. `M` is the only hardcoded input (the `FAST_MULTIPLIER`
+table); standard rates still come from your bill.
+
+Same CLI as the base tool:
+
+```bash
+python pull_usage_cost_hybrid.py --days 30 --csv ./out
+```
+
+Caveats:
+- The `speed` grouping needs the `fast-mode-2026-02-01` beta header. If your org doesn't have it,
+  the tool **falls back** to non-speed grouping (fast usage, if any, is blended) and prints a
+  banner saying so.
+- A fast-capable model missing from `FAST_MULTIPLIER` is **flagged**, not silently blended —
+  update the table when a new fast-capable model ships.
+- Depends on the usage-report `speed` field (see the note under `GET /usage_report/messages`).
+
+**Which to use:** no fast usage → the base tool is already exact, stick with it. Fast usage → use
+the hybrid. (Not sure which applies? Group usage by `speed` for a window and check — if every row
+is `standard`, the two tools agree.)
+
 ## Endpoint response shapes
 
 Trimmed to the fields this tool uses, with the gotchas called out. All four return
@@ -159,6 +206,9 @@ paginate *differently* (see notes).
 - `api_key_id` is `null` for Console/Workbench traffic; `workspace_id` is `null` for the
   default workspace.
 - Pagination: `has_more` + `next_page` → pass `next_page` back as the `page` query param.
+- With `group_by[]=speed` + the `fast-mode-2026-02-01` beta header, each result also carries a
+  `speed` field (`"standard"` / `"fast"`) — the hybrid tool's input. This beta dimension isn't
+  enumerated in the static API reference, so treat its exact placement as inferred.
 
 ### `GET /cost_report`
 
