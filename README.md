@@ -1,14 +1,22 @@
 # Anthropic API usage & cost puller
 
-Two Python scripts that pull your organization's **token usage** and **USD cost** from the
-Anthropic [Admin API](https://platform.claude.com/docs/en/manage-claude/admin-api) and estimate
-**cost per API key** (with a per-model breakdown):
+Three Python scripts for working with Claude API usage and cost data.
+
+**Pull from the Admin API** (need an `sk-ant-admin...` key) — per-API-key **token usage** and
+**USD cost**, with a per-model breakdown:
 
 - **`pull_usage_cost.py`** — the base tool.
 - **`pull_usage_cost_hybrid.py`** — adds fast-mode-aware cost attribution; see
   [Fast mode and the hybrid variant](#fast-mode-and-the-hybrid-variant).
 
-Both share the same CLI and talk to four endpoints under `https://api.anthropic.com/v1/organizations`:
+**Reshape an existing export** (no key, pure standard library):
+
+- **`shape_usage_to_cost_export.py`** — rewrites the usage tool's per-(api_key, model) output into
+  the Console cost-export column structure; see
+  [Reshaping into the Console export format](#reshaping-into-the-console-export-format).
+
+The two Admin-API tools share the same CLI and talk to four endpoints under
+`https://api.anthropic.com/v1/organizations`:
 
 | Endpoint | Used for |
 |---|---|
@@ -158,6 +166,37 @@ Caveats:
 **Which to use:** no fast usage → the base tool is already exact, stick with it. Fast usage → use
 the hybrid. (Not sure which applies? Group usage by `speed` for a window and check — if every row
 is `standard`, the two tools agree.)
+
+## Reshaping into the Console export format
+
+`shape_usage_to_cost_export.py` takes the usage tool's per-(api_key, model) CSV
+(`out/usage_cost_by_api_key_model.csv`) and rewrites it into the **column structure of a Console
+cost export** (`data/claude_api_cost_*.csv`) — useful for loading API-derived numbers into the same
+spreadsheet or pipeline as Console exports. Pure standard library; no API key.
+
+```bash
+python3 shape_usage_to_cost_export.py --date 2026-06-15
+# input:  out/usage_cost_by_api_key_model.csv          (override with a positional path)
+# output: out/usage_cost_by_api_key_model_console_format.csv   (override with --out)
+```
+
+It emits the 12 Console columns (`usage_date_utc, model, workspace, api_key, usage_type,
+context_window, token_type, cost_usd, list_price_usd, cost_type, inference_geo, speed`) at the
+(api_key, model) grain:
+
+- One `token` row per (api_key, model) per speed; one `web_search` row per api_key
+  (`model = "--"`, matching the export's convention).
+- **Hybrid auto-detection:** if the input came from `pull_usage_cost_hybrid.py`
+  (`standard_cost_usd` / `fast_cost_usd` columns), it emits separate `standard` and `fast` rows.
+  Base-tool input has no split, so every token row is `speed = standard`.
+- Dimensions not carried at the (api_key, model) grain (`workspace`, `context_window`,
+  `token_type`, `inference_geo`) are `"--"` — the export's own not-applicable marker. Model IDs
+  are mapped to display names (`claude-opus-4-8` → `Claude Opus 4.8`).
+- `usage_date_utc` comes from `--date` (the input carries no date; defaults to `"--"`).
+
+Two deliberate deviations from the export's exact values: `cost_usd` is kept at **full precision**
+(not cent-rounded), so the output reconciles to the input's `est_cost_usd` to the cent; and
+standard rows are marked `speed = "standard"` rather than left blank.
 
 ## Endpoint response shapes
 
